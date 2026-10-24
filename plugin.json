@@ -1,0 +1,46 @@
+{
+  "id": "phpforge.php-debugger",
+  "name": "PHP Debugger / Xdebug",
+  "version": "1.0.0",
+  "minIdeVersion": "0.2.11",
+  "description": "PHP Debugger / Xdebug: separate Rust tool service and workbench integration.",
+  "main": "main.js",
+  "activation": {
+    "languages": [
+      "php",
+      "json"
+    ],
+    "files": []
+  },
+  "permissions": [
+    "project.read",
+    "native.tool",
+    "workbench"
+  ],
+  "tool": {
+    "protocolVersion": 1,
+    "methods": [
+      "debugStatus",
+      "debugListen",
+      "debugUnlisten",
+      "debugConfig",
+      "debugRun",
+      "debugRunStop",
+      "debugContinue",
+      "debugStack",
+      "debugContexts",
+      "debugVariables",
+      "debugProperty",
+      "debugEval"
+    ],
+    "event": "debug-event",
+    "workbench": "workbench.js",
+    "style": "workbench.css",
+    "binaries": {
+      "aarch64-macos": {
+        "path": "bin/aarch64-macos/phpforge-php-debugger",
+        "sha256": "054459c99f7c55187df01de1f2068c4e6b141ba0e322317d62543c348f7b0101"
+      }
+    }
+  }
+}

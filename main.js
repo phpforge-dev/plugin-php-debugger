@@ -1,0 +1,1 @@
+(()=>{ide.register({detect:async()=>({})});})();
