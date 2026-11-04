@@ -17,6 +17,21 @@ Installation never runs npm, Cargo or project build scripts. The host checks pla
 
 No passwords or private credentials belong in this repository, fixtures or logs. Do not send runtime values or tool output to an agent automatically.
 
+## Features
+
+Behaviour follows the public PhpStorm help and an authorized observation of PhpStorm 2026.1.4 (see
+`docs/research/xdebug-fidelity.md` in php-ide). No JetBrains code or assets are used.
+
+- Breakpoints in place of the line number: click toggles, Alt+click enables/disables, Shift+click adds a logging
+  (non-suspending) breakpoint, right-click opens the properties popup or the Add Breakpoint menu, Cmd+F8 at the caret.
+  Icons for line, conditional, disabled, logging, verified (accepted by Xdebug), invalid and muted.
+- View Breakpoints (Shift+Cmd+F8): PHP line and PHP exception breakpoints, enable/condition/log/remove-once options.
+- Debug window: session tabs, Stop/Resume/Pause/Step toolbar, Threads & Variables (frames, `{type} value` tree,
+  watches, evaluate field with Enter / Shift+Cmd+Enter), Console, Mute Breakpoints, settings and path mappings.
+- Evaluate Expression (Alt+F8) window and inline values next to the code of the current function.
+- Pause Program sends DBGp `break` only when the engine reports `supports_async`; Xdebug 3.4 reports 0, so the button
+  stays disabled with an explanation (PhpStorm offers no Pause for Xdebug either).
+
 ## Development
 
 Use Node only to build browser assets and Rust to build the tool. There is no Node application backend.
@@ -24,7 +39,7 @@ Use Node only to build browser assets and Rust to build the tool. There is no No
 ```sh
 npm ci --ignore-scripts
 npm run build
-cargo test --manifest-path native/Cargo.toml
+npm test                     # Rust service + UI rules (node:test)
 cargo build --release --manifest-path native/Cargo.toml
 node scripts/record-binary.mjs
 ```

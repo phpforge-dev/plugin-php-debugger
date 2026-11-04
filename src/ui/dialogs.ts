@@ -172,16 +172,17 @@ export function mountDialogs(ctx: DialogCtx) {
   win.append(head, label, input, hint, el('div', 'debug-field-label', tr('Resultado:')), result, foot);
   document.body.append(win); evaluateWindow = win;
   const shut = () => { win.remove(); evaluateWindow = undefined; ctx.restoreFocus(); };
+  let busy = false;
   const go = async () => {
-   const expression = input.value.trim(); if (!expression) return;
+   const expression = input.value.trim(); if (!expression || busy) return;
    if (!ctx.paused()) { result.replaceChildren(propNode(ctx.tree, { name: 'result', fullname: '', type: 'error', value: tr('Pause num breakpoint para avaliar expressões'), children: false, numchildren: 0, page: 0, items: [] }, { kind: 'error' })); return; }
-   run.disabled = true;
+   busy = true; run.disabled = true;
    try {
     const p = await ctx.evaluate(expression);
     result.replaceChildren(p ? propNode(ctx.tree, { ...p, fullname: p.fullname || expression }, { kind: 'result', label: 'result' }) : el('li', 'debug-empty', tr('(sem valor)')));
     result.querySelector<HTMLButtonElement>('.debug-twist:not(:disabled)')?.click();
    } catch (error) { result.replaceChildren(propNode(ctx.tree, { name: 'result', fullname: '', type: 'error', value: String((error as Error)?.message ?? error), children: false, numchildren: 0, page: 0, items: [] }, { kind: 'error' })); }
-   finally { run.disabled = false; }
+   finally { busy = false; run.disabled = false; }
   };
   run.onclick = () => void go(); close.onclick = shut;
   win.onkeydown = e => {
@@ -194,7 +195,6 @@ export function mountDialogs(ctx: DialogCtx) {
    head.onpointermove = m => { win.style.left = Math.max(0, m.clientX - dx) + 'px'; win.style.top = Math.max(0, m.clientY - dy) + 'px'; win.style.transform = 'none'; };
    head.onpointerup = () => { head.onpointermove = null; }; };
   input.focus(); input.select();
-  if (initial && ctx.paused()) void go();
  }
  return { breakpoints, evaluate, refresh: () => open?.refresh(), close: () => { open?.close(); evaluateWindow?.remove(); evaluateWindow = undefined; } };
 }
