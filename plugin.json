@@ -27,6 +27,7 @@
       "debugRun",
       "debugRunStop",
       "debugContinue",
+      "debugPause",
       "debugStack",
       "debugContexts",
       "debugVariables",

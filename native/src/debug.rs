@@ -531,6 +531,8 @@ struct Session {
     breakpoints: Mutex<HashMap<String, String>>,
     /// id do Xdebug → evento que identifica o breakpoint na UI (para `breakpoint_resolved`).
     targets: Mutex<HashMap<String, Value>>,
+    /// `feature_get supports_async`: o motor lê comandos (como `break`) durante a execução.
+    async_commands: std::sync::atomic::AtomicBool,
     sync: AsyncMutex<()>,
     /// Fecha a conexão pelo lado do IDE (após stop/detach, sem esperar o motor).
     closed: tokio::sync::Notify,
@@ -703,6 +705,21 @@ impl Debugger {
                         resume(inner.clone(), session, action, emit)?;
                         Ok(Value::Null)
                     }
+                    "debugPause" => {
+                        if session.status() != "running" {
+                            return Err("O script não está em execução".into());
+                        }
+                        if !session.async_commands.load(Ordering::Relaxed) {
+                            return Err("Este motor de depuração não aceita pausa durante a execução (DBGp supports_async = 0). Use um breakpoint.".into());
+                        }
+                        // DBGp `break` (assíncrono): o Xdebug responde a ele e depois ao `run` pendente,
+                        // que chega como evento "break" pelo laço de `resume`.
+                        session
+                            .send("break", &[], None, Some(Duration::from_secs(5)))
+                            .await
+                            .map_err(|e| format!("O Xdebug não atendeu ao pedido de pausa: {e}"))?;
+                        Ok(Value::Null)
+                    }
                     "debugStack" => {
                         paused(&session)?;
                         stack(inner, &session).await
@@ -782,7 +799,7 @@ impl Debugger {
         let sessions = self.inner.sessions.lock().map_err(err)?;
         Ok(json!({
             "listening": listener.as_ref().map(|(port, all, _)| json!({"port": port, "all": all})),
-            "sessions": sessions.values().map(|s| json!({"id": s.id, "status": s.status(), "info": s.info})).collect::<Vec<_>>(),
+            "sessions": sessions.values().map(|s| json!({"id": s.id, "status": s.status(), "info": s.info, "async": s.async_commands.load(Ordering::Relaxed)})).collect::<Vec<_>>(),
         }))
     }
 
@@ -959,6 +976,7 @@ async fn connection(inner: Arc<Inner>, stream: TcpStream, emit: Emit) {
         status: Mutex::new("starting".into()),
         breakpoints: Mutex::new(HashMap::new()),
         targets: Mutex::new(HashMap::new()),
+        async_commands: std::sync::atomic::AtomicBool::new(false),
         sync: AsyncMutex::new(()),
         closed: tokio::sync::Notify::new(),
         info: info.clone(),
@@ -1062,6 +1080,13 @@ async fn setup(inner: &Arc<Inner>, session: &Arc<Session>, emit: &Emit) -> Res<(
             .send("feature_set", &[("-n", name.into()), ("-v", value.into())], None, Some(COMMAND_TIMEOUT))
             .await;
     }
+    let supports_async = session
+        .send("feature_get", &[("-n", "supports_async".into())], None, Some(COMMAND_TIMEOUT))
+        .await
+        .map(|x| x.attr("supported") == Some("1") && x.text.trim() == "1")
+        .unwrap_or(false);
+    session.async_commands.store(supports_async, Ordering::Relaxed);
+    emit(json!({"kind": "capabilities", "session": session.id, "async": supports_async}));
     if session.info["run"].is_null() {
         let _ = session.send("stdout", &[("-c", "1".into())], None, Some(COMMAND_TIMEOUT)).await;
     }
@@ -1408,6 +1433,62 @@ mod tests {
         debugger.dispatch(&root, "debugUnlisten", &[], emit).await.unwrap();
     }
 
+    /// Pause Program: `break` while `run` is pending; the engine answers `break`, then `run` with status=break.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pauses_a_running_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("loop.php"), "<?php\nwhile (true) {}\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let emit: Emit = Arc::new(move |v| { let _ = tx.send(v); });
+        let debugger = Debugger::default();
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        debugger.dispatch(&root, "debugConfig", &[json!([]), json!([{"server":"/app","local":""}]), json!(false)], emit.clone()).await.unwrap();
+        debugger.dispatch(&root, "debugListen", &[json!(port), json!(false)], emit.clone()).await.unwrap();
+        let engine = tokio::spawn(async move {
+            let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let send = |xml: String| format!("{}\0{}\0", xml.len(), xml).into_bytes();
+            write.write_all(&send(r#"<init fileuri="file:///app/loop.php" language="PHP" protocol_version="1.0" idekey="X"><engine version="3.4.5">Xdebug</engine></init>"#.into())).await.unwrap();
+            let mut running = None;
+            loop {
+                let mut cmd = Vec::new();
+                if reader.read_until(0, &mut cmd).await.unwrap() == 0 { break; }
+                cmd.pop();
+                let cmd = String::from_utf8(cmd).unwrap();
+                let parts: Vec<&str> = cmd.split(' ').collect();
+                let (name, tx) = (parts[0], parts[2].to_owned());
+                let body = match name {
+                    "run" => { running = Some(tx); continue; }
+                    "feature_get" => format!(r#"<response command="feature_get" transaction_id="{tx}" feature_name="supports_async" supported="1"><![CDATA[1]]></response>"#),
+                    "break" => {
+                        let run = running.take().expect("break only while running");
+                        write.write_all(&send(format!(r#"<response command="break" transaction_id="{tx}" success="1"/>"#))).await.unwrap();
+                        format!(r#"<response command="run" transaction_id="{run}" status="break" reason="ok"/>"#)
+                    }
+                    "stack_get" => format!(r#"<response command="stack_get" transaction_id="{tx}"><stack where="{{main}}" level="0" type="file" filename="file:///app/loop.php" lineno="2"/></response>"#),
+                    "stop" => { write.write_all(&send(format!(r#"<response command="stop" transaction_id="{tx}" status="stopped" reason="ok"/>"#))).await.unwrap(); break; }
+                    _ => format!(r#"<response command="{name}" transaction_id="{tx}" success="1"/>"#),
+                };
+                write.write_all(&send(body)).await.unwrap();
+            }
+        });
+        async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Value>, kind: &str) -> Value {
+            loop { let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap(); if ev["kind"] == kind { return ev; } }
+        }
+        let session = next(&mut rx, "session").await["session"].as_str().unwrap().to_owned();
+        assert_eq!(next(&mut rx, "capabilities").await["async"], true);
+        next(&mut rx, "running").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        debugger.dispatch(&root, "debugPause", &[json!(session)], emit.clone()).await.unwrap();
+        let brk = next(&mut rx, "break").await;
+        assert_eq!(brk["frames"][0]["line"], 2);
+        assert!(debugger.dispatch(&root, "debugPause", &[json!(session)], emit.clone()).await.unwrap_err().contains("não está em execução"));
+        debugger.dispatch(&root, "debugContinue", &[json!(session), json!("stop")], emit.clone()).await.unwrap();
+        engine.await.unwrap();
+        debugger.dispatch(&root, "debugUnlisten", &[], emit).await.unwrap();
+    }
 }
 
 #[cfg(test)]

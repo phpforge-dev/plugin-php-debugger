@@ -192,3 +192,65 @@ async fn xdebug_debug_script() {
     std::env::remove_var("PHP_IDE_PHP_BIN");
     d.dispatch(&root, "debugUnlisten", &[], emit).await.unwrap();
 }
+
+/// Pause Program com Xdebug real: `break` enquanto o script roda num laço longo.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn xdebug_pause_and_exception_breakpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("app.php"), "<?php\nnamespace App;\nclass Boom extends \\RuntimeException {}\nfunction fail() { throw new Boom('x'); }\ntry { fail(); } catch (\\Throwable $e) {}\n$i = 0;\nwhile (true) {\n    $i++;\n}\n").unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let emit: Emit = Arc::new(move |v| {
+        let _ = tx.send(v);
+    });
+    let mut events = Events(rx, String::new());
+    let d = Debugger::default();
+    let call = |method: &'static str, args: Vec<Value>| {
+        let (d, root, emit) = (&d, root.clone(), emit.clone());
+        async move { d.dispatch(&root, method, &args, emit).await }
+    };
+    let port = free_port();
+    call("debugConfig", vec![json!([]), json!([{"server": "/app", "local": ""}]), json!(false), json!([{"name": "App\\Boom"}])]).await.unwrap();
+    call("debugListen", vec![json!(port), json!(std::env::var_os("PHP_IDE_XDEBUG_BIND_ALL").is_some())]).await.unwrap();
+    let name = format!("phpide-xdebug-pause-{port}");
+    // Remove o container mesmo se o teste falhar: o script fica num laço infinito.
+    struct Kill(String);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker").args(["kill", &self.0]).output();
+        }
+    }
+    let _guard = Kill(name.clone());
+    let mut container = std::process::Command::new("docker")
+        .args(["run", "--rm", "--name", &name, "--add-host=host.docker.internal:host-gateway", "-v"])
+        .arg(format!("{}:/app", root.display()))
+        .arg(image())
+        .args(["php", "-dxdebug.mode=debug", "-dxdebug.start_with_request=yes", "-dxdebug.client_host=host.docker.internal"])
+        .arg(format!("-dxdebug.client_port={port}"))
+        .arg("/app/app.php")
+        .spawn()
+        .unwrap();
+    let id = events.until("session").await["session"].as_str().unwrap().to_owned();
+    assert_eq!(events.until("capabilities").await["async"], false);
+    let state = events.until("breakpoint").await;
+    assert_eq!(state["exception"], "App\\Boom", "{state}");
+    assert_ne!(state["state"], "invalid", "{state}");
+    let brk = events.until("break").await;
+    assert_eq!(brk["exception"], "App\\Boom", "{brk}");
+    assert_eq!(brk["frames"][0]["line"], 4, "{brk}");
+    call("debugContinue", vec![json!(id), json!("run")]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Xdebug 3.4.5 anuncia supports_async = 0 e não lê o socket durante a execução (o PhpStorm 2026.1.4
+    // também não oferece Pause nesta configuração): o pedido falha na hora, com erro recuperável.
+    let paused = call("debugPause", vec![json!(id)]).await.unwrap_err();
+    assert!(paused.contains("supports_async"), "{paused}");
+    let status = call("debugStatus", vec![]).await.unwrap();
+    assert_eq!(status["sessions"][0]["status"], "running", "{status}");
+    assert_eq!(status["sessions"][0]["async"], false, "{status}");
+    call("debugContinue", vec![json!(id), json!("stop")]).await.unwrap();
+    events.until("ended").await;
+    let _ = container.kill();
+    let _ = container.wait();
+    call("debugUnlisten", vec![]).await.unwrap();
+}
