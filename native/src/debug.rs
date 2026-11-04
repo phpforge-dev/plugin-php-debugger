@@ -503,10 +503,21 @@ fn enabled() -> bool {
     true
 }
 
+/// Breakpoint de exceção (DBGp `breakpoint_set -t exception -x Classe`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ExceptionBreakpoint {
+    pub name: String,
+    #[serde(default)]
+    pub condition: String,
+    #[serde(default = "enabled")]
+    pub enabled: bool,
+}
+
 #[derive(Default, Clone)]
 struct Config {
     root: PathBuf,
     breakpoints: Vec<Breakpoint>,
+    exceptions: Vec<ExceptionBreakpoint>,
     mappings: Vec<Mapping>,
     break_first: bool,
 }
@@ -518,6 +529,8 @@ struct Session {
     next: AtomicU32,
     status: Mutex<String>,
     breakpoints: Mutex<HashMap<String, String>>,
+    /// id do Xdebug → evento que identifica o breakpoint na UI (para `breakpoint_resolved`).
+    targets: Mutex<HashMap<String, Value>>,
     sync: AsyncMutex<()>,
     /// Fecha a conexão pelo lado do IDE (após stop/detach, sem esperar o motor).
     closed: tokio::sync::Notify,
@@ -617,7 +630,19 @@ impl Debugger {
                     serde_json::from_value(a(0).clone()).map_err(|_| "Breakpoints inválidos")?;
                 let mappings: Vec<Mapping> =
                     serde_json::from_value(a(1).clone()).map_err(|_| "Mapeamentos inválidos")?;
-                if breakpoints.len() > 5000 || mappings.len() > 100 {
+                let exceptions: Vec<ExceptionBreakpoint> = match a(3) {
+                    Value::Null => vec![],
+                    v => serde_json::from_value(v.clone()).map_err(|_| "Breakpoints de exceção inválidos")?,
+                };
+                for e in &exceptions {
+                    let valid = !e.name.is_empty()
+                        && e.name.len() <= 512
+                        && e.name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '\\' || c == '*');
+                    if !valid || e.condition.len() > 10000 || e.condition.contains('\0') {
+                        return Err(format!("Breakpoint de exceção inválido: {}", e.name));
+                    }
+                }
+                if breakpoints.len() > 5000 || mappings.len() > 100 || exceptions.len() > 500 {
                     return Err("Configuração de depuração grande demais".into());
                 }
                 for b in &breakpoints {
@@ -643,6 +668,7 @@ impl Debugger {
                     let mut c = inner.config.lock().map_err(err)?;
                     c.breakpoints = breakpoints;
                     c.mappings = mappings;
+                    c.exceptions = exceptions;
                     c.break_first = a(2).as_bool().unwrap_or(false);
                 }
                 let sessions: Vec<_> = inner.sessions.lock().map_err(err)?.values().cloned().collect();
@@ -932,6 +958,7 @@ async fn connection(inner: Arc<Inner>, stream: TcpStream, emit: Emit) {
         next: AtomicU32::new(1),
         status: Mutex::new("starting".into()),
         breakpoints: Mutex::new(HashMap::new()),
+        targets: Mutex::new(HashMap::new()),
         sync: AsyncMutex::new(()),
         closed: tokio::sync::Notify::new(),
         info: info.clone(),
@@ -1000,6 +1027,16 @@ async fn read_loop(session: Arc<Session>, mut reader: BufReader<tokio::net::tcp:
             }
             "notify" => {
                 let bp = x.child("breakpoint");
+                if x.attr("name") == Some("breakpoint_resolved") {
+                    let target = bp.and_then(|b| b.attr("id")).and_then(|id| session.targets.lock().ok()?.get(id).cloned());
+                    if let Some(mut state) = target {
+                        state["kind"] = json!("breakpoint");
+                        state["session"] = json!(session.id);
+                        state["state"] = json!("verified");
+                        state["resolvedLine"] = json!(bp.and_then(|b| b.attr("lineno")).and_then(|v| v.parse::<u64>().ok()));
+                        emit(state);
+                    }
+                }
                 emit(json!({
                     "kind": "notify",
                     "session": session.id,
@@ -1037,17 +1074,37 @@ fn breakpoint_key(uri: &str, b: &Breakpoint) -> String {
     format!("{uri}\n{}\n{}", b.line, b.condition.trim())
 }
 
+/// Um pedido `breakpoint_set` e o evento que identifica o breakpoint na UI.
+struct Wanted {
+    args: Vec<(&'static str, String)>,
+    condition: String,
+    target: Value,
+}
+
 async fn sync_breakpoints(inner: &Arc<Inner>, session: &Arc<Session>, emit: &Emit) {
     let _guard = session.sync.lock().await;
     let config = match inner.config.lock() {
         Ok(c) => c.clone(),
         Err(_) => return,
     };
-    let mut want = HashMap::new();
+    let mut want: HashMap<String, Wanted> = HashMap::new();
     for b in config.breakpoints.iter().filter(|b| b.enabled) {
         let local = config.root.join(&b.path);
         let uri = path_to_uri(&to_server(&config.root, &config.mappings, &local));
-        want.insert(breakpoint_key(&uri, b), (uri, b.clone()));
+        let condition = b.condition.trim().to_owned();
+        let args = vec![
+            ("-t", if condition.is_empty() { "line" } else { "conditional" }.to_owned()),
+            ("-f", uri.clone()),
+            ("-n", b.line.to_string()),
+        ];
+        want.insert(breakpoint_key(&uri, b), Wanted { args, condition, target: json!({"path": b.path, "line": b.line}) });
+    }
+    for e in config.exceptions.iter().filter(|e| e.enabled) {
+        let condition = e.condition.trim().to_owned();
+        want.insert(
+            format!("exception\n{}\n{condition}", e.name),
+            Wanted { args: vec![("-t", "exception".into()), ("-x", e.name.clone())], condition, target: json!({"exception": e.name}) },
+        );
     }
     let have = session.breakpoints.lock().map(|b| b.clone()).unwrap_or_default();
     for (key, id) in have.iter().filter(|(k, _)| !want.contains_key(*k)) {
@@ -1057,28 +1114,37 @@ async fn sync_breakpoints(inner: &Arc<Inner>, session: &Arc<Session>, emit: &Emi
         if let Ok(mut b) = session.breakpoints.lock() {
             b.remove(key);
         }
+        if let Ok(mut t) = session.targets.lock() {
+            t.remove(id);
+        }
     }
-    for (key, (uri, b)) in want.into_iter().filter(|(k, _)| !have.contains_key(k)) {
-        let condition = b.condition.trim();
-        let mut args = vec![
-            ("-t", if condition.is_empty() { "line" } else { "conditional" }.to_owned()),
-            ("-f", uri),
-            ("-n", b.line.to_string()),
-        ];
-        if !b.enabled {
-            args.push(("-s", "disabled".into()));
-        }
+    for (key, w) in want.into_iter().filter(|(k, _)| !have.contains_key(k)) {
         let result = session
-            .send("breakpoint_set", &args, (!condition.is_empty()).then_some(condition), Some(COMMAND_TIMEOUT))
+            .send("breakpoint_set", &w.args, (!w.condition.is_empty()).then_some(w.condition.as_str()), Some(COMMAND_TIMEOUT))
             .await;
-        match result.and_then(|x| x.attr("id").map(str::to_owned).ok_or_else(|| "Xdebug não devolveu id do breakpoint".to_owned())) {
-            Ok(id) => {
+        let mut state = w.target.clone();
+        state["kind"] = json!("breakpoint");
+        state["session"] = json!(session.id);
+        match result.and_then(|x| {
+            let id = x.attr("id").map(str::to_owned).ok_or_else(|| "Xdebug não devolveu id do breakpoint".to_owned())?;
+            Ok((id, x.attr("resolved").map(str::to_owned)))
+        }) {
+            Ok((id, resolved)) => {
                 if let Ok(mut map) = session.breakpoints.lock() {
-                    map.insert(key, id);
+                    map.insert(key, id.clone());
                 }
+                if let Ok(mut t) = session.targets.lock() {
+                    t.insert(id, w.target);
+                }
+                // Sem `resolved` (Xdebug antigo) o breakpoint foi aceito; "unresolved" = arquivo ainda não carregado.
+                state["state"] = json!(if resolved.as_deref() == Some("unresolved") { "pending" } else { "verified" });
             }
-            Err(e) => emit(json!({"kind": "error", "session": session.id, "message": format!("Breakpoint {}:{}: {e}", b.path, b.line)})),
+            Err(e) => {
+                state["state"] = json!("invalid");
+                state["message"] = json!(e);
+            }
         }
+        emit(state);
     }
 }
 
@@ -1259,7 +1325,8 @@ mod tests {
         let emit: Emit = Arc::new(move |v| { let _ = tx.send(v); });
         let debugger = Debugger::default();
         let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
-        debugger.dispatch(&root, "debugConfig", &[json!([{"path":"index.php","line":3}]), json!([{"server":"/app","local":""}]), json!(false)], emit.clone()).await.unwrap();
+        debugger.dispatch(&root, "debugConfig", &[json!([{"path":"index.php","line":3}]), json!([{"server":"/app","local":""}]), json!(false), json!([{"name":"App\\Boom"},{"name":"Off","enabled":false}])], emit.clone()).await.unwrap();
+        assert!(debugger.dispatch(&root, "debugConfig", &[json!([]), json!([]), json!(false), json!([{"name":"x; rm"}])], emit.clone()).await.is_err());
         let status = debugger.dispatch(&root, "debugListen", &[json!(port), json!(false)], emit.clone()).await.unwrap();
         assert_eq!(status["listening"]["port"], port);
         // Second IDE on the same port: recoverable, explicit error.
@@ -1283,8 +1350,11 @@ mod tests {
                 let (name, tx) = (parts[0], parts[2]);
                 seen.push(cmd.clone());
                 let body = match name {
-                    "breakpoint_set" => { assert!(cmd.contains("-f file:///app/index.php -n 3")); format!(r#"<response command="breakpoint_set" transaction_id="{tx}" id="77"/>"#) }
+                    "breakpoint_set" if cmd.contains("-t exception") => { assert!(cmd.contains(r#"-x "App\\Boom""#), "{cmd}"); format!(r#"<response command="breakpoint_set" transaction_id="{tx}" id="78" resolved="resolved"/>"#) }
+                    "breakpoint_set" => { assert!(cmd.contains("-f file:///app/index.php -n 3")); format!(r#"<response command="breakpoint_set" transaction_id="{tx}" id="77" resolved="unresolved"/>"#) }
                     "run" => {
+                        let note = r#"<notify name="breakpoint_resolved"><breakpoint id="77" type="line" resolved="resolved" filename="file:///app/index.php" lineno="3"/></notify>"#;
+                        write.write_all(&send(note.into())).await.unwrap();
                         let out = base64_encode(b"hello");
                         write.write_all(&send(format!(r#"<stream type="stdout" encoding="base64">{out}</stream>"#))).await.unwrap();
                         format!(r#"<response command="run" transaction_id="{tx}" status="break" reason="ok"><xdebug:message filename="file:///app/index.php" lineno="3"/></response>"#)
@@ -1302,9 +1372,11 @@ mod tests {
 
         let mut session = String::new();
         let mut output = String::new();
+        let mut states = Vec::new();
         let brk = loop {
             let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
             match ev["kind"].as_str().unwrap() {
+                "breakpoint" => states.push(ev),
                 "session" => { session = ev["session"].as_str().unwrap().into(); assert_eq!(ev["info"]["local"], "index.php"); }
                 "output" => output.push_str(ev["text"].as_str().unwrap()),
                 "break" => break ev,
@@ -1312,6 +1384,10 @@ mod tests {
             }
         };
         assert_eq!(output, "hello");
+        assert!(states.iter().any(|e| e["path"] == "index.php" && e["line"] == 3 && e["state"] == "pending"), "{states:?}");
+        assert!(states.iter().any(|e| e["path"] == "index.php" && e["state"] == "verified" && e["resolvedLine"] == 3), "{states:?}");
+        assert!(states.iter().any(|e| e["exception"] == "App\\Boom" && e["state"] == "verified"), "{states:?}");
+        assert!(!states.iter().any(|e| e["exception"] == "Off"), "disabled exception breakpoints are not sent");
         assert_eq!(brk["frames"][0]["local"], "index.php");
         assert_eq!(brk["frames"][0]["line"], 3);
         assert!(brk["frames"][1]["local"].is_null(), "unmapped frame must be reported");
@@ -1331,6 +1407,7 @@ mod tests {
         assert!(debugger.dispatch(&root, "debugStack", &[json!(session)], emit.clone()).await.unwrap_err().contains("encerrada"));
         debugger.dispatch(&root, "debugUnlisten", &[], emit).await.unwrap();
     }
+
 }
 
 #[cfg(test)]
